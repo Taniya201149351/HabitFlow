@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HabitFlow</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+
+<!-- ════════════════════════════════════════════
+     SETUP INSTRUCTIONS — READ BEFORE OPENING
+     ════════════════════════════════════════════
+  1. Go to https://console.firebase.google.com
+  2. Click "Add project" → name it "HabitFlow" → Create
+  3. In the project, click "</>" (Web app) → Register app
+  4. Copy the firebaseConfig object and paste it below
+     replacing the placeholder values
+  5. In Firebase console → Authentication → Get started
+     → Enable "Google" and "Email/Password" providers
+  6. In Firebase console → Firestore Database → Create database
+     → Start in test mode → Choose your region
+  7. Save this file and open it in browser
+  ════════════════════════════════════════════ -->
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, createUserWithEmailAndPassword,
+         signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, doc, setDoc, getDoc, collection, addDoc, updateDoc,
+         deleteDoc, onSnapshot, query, orderBy, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+/* ─── PASTE YOUR FIREBASE CONFIG HERE ─── */
+const firebaseConfig = {
+  apiKey:            "AIzaSyA30zJXBTqMeMnGGT33NnFzM3_wmM4JYG0",
+  authDomain:        "habitflow-592d5.firebaseapp.com",
+  projectId:         "habitflow-592d5",
+  storageBucket:     "habitflow-592d5.firebasestorage.app",
+  messagingSenderId: "769178351515",
+  appId:             "1:769178351515:web:5cc217dfd9ddc28361533e",
+  measurementId: "G-CZCST9YPRT"
+};
+/* ─────────────────────────────────────── */
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+
+const CAT_COLORS = { health:'#1D9E75', mind:'#7F77DD', work:'#378ADD', other:'#888780' };
+const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+let currentUser = null;
+let habits = [];
+let logCache = {};
+let unsubHabits = null;
+let mainChart = null;
+let currentChartTab = 'weekly';
+
+function dateStr(d) { return d.toISOString().split('T')[0]; }
+function addDays(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
+const today = new Date();
+const todayStr = dateStr(today);
+
+/* ══════════════ AUTH ══════════════ */
+
+async function loginGoogle() {
+  try {
+    clearAuthError();
+    const provider = new GoogleAuthProvider();
+    await signInWithPopup(auth, provider);
+  } catch(e) { showAuthError(e.message); }
+}
+
+async function loginEmail() {
+  const email = document.getElementById('auth-email').value.trim();
+  const pass  = document.getElementById('auth-pass').value;
+  if (!email || !pass) return showAuthError('Enter email and password.');
+  try {
+    clearAuthError();
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(e) { showAuthError(friendlyError(e.code)); }
+}
+
+async function registerEmail() {
+  const name  = document.getElementById('auth-name').value.trim();
+  const email = document.getElementById('auth-email').value.trim();
+  const pass  = document.getElementById('auth-pass').value;
+  if (!name)  return showAuthError('Enter your name.');
+  if (!email || !pass) return showAuthError('Enter email and password.');
+  if (pass.length < 6) return showAuthError('Password must be at least 6 characters.');
+  try {
+    clearAuthError();
+    const cred = await createUserWithEmailAndPassword(auth, email, pass);
+    await updateProfile(cred.user, { displayName: name });
+    await setDoc(doc(db, 'users', cred.user.uid), {
+      name, email, createdAt: serverTimestamp(), goal: 'Build better habits'
+    });
+  } catch(e) { showAuthError(friendlyError(e.code)); }
+}
+
+async function logout() {
+  if (unsubHabits) unsubHabits();
+  habits = []; logCache = {};
+  await signOut(auth);
+}
+
+function friendlyError(code) {
+  const map = {
+    'auth/user-not-found': 'No account found with this email.',
+    'auth/wrong-password': 'Incorrect password.',
+    'auth/email-already-in-use': 'This email is already registered. Try logging in.',
+    'auth/invalid-email': 'Invalid email address.',
+    'auth/weak-password': 'Password must be at least 6 characters.',
+    'auth/invalid-credential': 'Incorrect email or password.',
+  };
+  return map[code] || 'Something went wrong. Please try again.';
+}
+
+function showAuthError(msg) {
+  const el = document.getElementById('auth-error');
+  el.textContent = msg; el.style.display = 'block';
+}
+function clearAuthError() {
+  const el = document.getElementById('auth-error');
+  el.textContent = ''; el.style.display = 'none';
+}
+
+onAuthStateChanged(auth, async (user) => {
+  if (user) {
+    currentUser = user;
+    showApp();
+    await loadUserProfile();
+    subscribeHabits();
+    scheduleReminder();
+  } else {
+    currentUser = null;
+    showAuth('login');
+  }
+});
+
+/* ══════════════ PROFILE ══════════════ */
+
+async function loadUserProfile() {
+  const snap = await getDoc(doc(db, 'users', currentUser.uid));
+  const data = snap.exists() ? snap.data() : {};
+  const name = currentUser.displayName || data.name || 'Friend';
+  const photo = currentUser.photoURL;
+  document.getElementById('nav-name').textContent = name;
+  document.getElementById('profile-name').textContent = name;
+  document.getElementById('profile-email').textContent = currentUser.email;
+  document.getElementById('profile-goal').value = data.goal || '';
+  document.getElementById('profile-joined').textContent =
+    data.createdAt ? new Date(data.createdAt.seconds * 1000).toLocaleDateString('en-IN', { month:'long', year:'numeric' }) : '—';
+  if (photo) {
+    document.getElementById('nav-avatar').innerHTML = `<img src="${photo}" style="width:28px;height:28px;border-radius:50%;object-fit:cover;">`;
+    document.getElementById('profile-avatar').innerHTML = `<img src="${photo}" style="width:64px;height:64px;border-radius:50%;object-fit:cover;">`;
+  } else {
+    const initials = name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+    document.getElementById('nav-avatar').textContent = initials[0];
+    document.getElementById('profile-avatar').textContent = initials;
+  }
+}
+
+async function saveProfile() {
+  const goal = document.getElementById('profile-goal').value.trim();
+  const notifTime = document.getElementById('notif-time').value;
+  const notifFreq = document.getElementById('notif-freq').value;
+  await setDoc(doc(db, 'users', currentUser.uid), { goal, notifTime, notifFreq }, { merge: true });
+  showToast('Profile saved!');
+}
+
+/* ══════════════ HABITS (Firestore) ══════════════ */
+
+function subscribeHabits() {
+  const q = query(collection(db, 'users', currentUser.uid, 'habits'), orderBy('createdAt'));
+  unsubHabits = onSnapshot(q, snap => {
+    habits = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    renderTracker();
+    if (document.getElementById('page-analytics').classList.contains('active')) renderAnalytics();
+  });
+}
+
+async function addHabit() {
+  const input = document.getElementById('habit-input');
+  const cat   = document.getElementById('cat-select').value;
+  const name  = input.value.trim();
+  if (!name) return;
+  input.value = '';
+  await addDoc(collection(db, 'users', currentUser.uid, 'habits'), {
+    name, cat, createdAt: serverTimestamp()
+  });
+}
+
+async function deleteHabit(id) {
+  if (!confirm('Delete this habit and all its history?')) return;
+  await deleteDoc(doc(db, 'users', currentUser.uid, 'habits', id));
+  const logRef = doc(db, 'users', currentUser.uid, 'logs', todayStr);
+  const snap = await getDoc(logRef);
+  if (snap.exists()) {
+    const done = (snap.data().done || []).filter(x => x !== id);
+    await setDoc(logRef, { done }, { merge: false });
+  }
+}
+
+async function toggleHabit(id) {
+  const logRef = doc(db, 'users', currentUser.uid, 'logs', todayStr);
+  const snap = await getDoc(logRef);
+  let done = snap.exists() ? (snap.data().done || []) : [];
+  const idx = done.indexOf(id);
+  if (idx === -1) done.push(id); else done.splice(idx, 1);
+  await setDoc(logRef, { done, date: todayStr }, { merge: false });
+  logCache[todayStr] = done;
+  renderTracker();
+  if (document.getElementById('page-analytics').classList.contains('active')) renderAnalytics();
+}
+
+async function getTodayLog() {
+  if (logCache[todayStr] !== undefined) return logCache[todayStr];
+  const snap = await getDoc(doc(db, 'users', currentUser.uid, 'logs', todayStr));
+  const done = snap.exists() ? (snap.data().done || []) : [];
+  logCache[todayStr] = done;
+  return done;
+}
+
+async function getLog(ds) {
+  if (logCache[ds] !== undefined) return logCache[ds];
+  const snap = await getDoc(doc(db, 'users', currentUser.uid, 'logs', ds));
+  const done = snap.exists() ? (snap.data().done || []) : [];
+  logCache[ds] = done;
+  return done;
+}
+
+async function getDayDone(ds) {
+  const log = await getLog(ds);
+  return habits.filter(h => log.includes(h.id)).length;
+}
+
+async function getStreak(id) {
+  let streak = 0, d = new Date(today);
+  while (streak < 365) {
+    const ds = dateStr(d);
+    const log = await getLog(ds);
+    if (log.includes(id)) { streak++; d.setDate(d.getDate() - 1); }
+    else break;
+  }
+  return streak;
+}
+
+async function getBestStreak() {
+  let best = 0;
+  for (const h of habits) { const s = await getStreak(h.id); if (s > best) best = s; }
+  return best;
+}
+
+async function getWeekAvg() {
+  let sum = 0;
+  for (let i = 0; i < 7; i++) sum += await getDayDone(dateStr(addDays(today, -i)));
+  return (Math.round(sum / 7 * 10) / 10).toFixed(1);
+}
+
+/* ══════════════ TRACKER RENDER ══════════════ */
+
+async function renderTracker() {
+  const todayLog = await getTodayLog();
+  const done  = habits.filter(h => todayLog.includes(h.id)).length;
+  const total = habits.length;
+  const pct   = total > 0 ? Math.round(done / total * 100) : 0;
+  const best  = await getBestStreak();
+  const avg   = await getWeekAvg();
+
+  document.getElementById('date-label').textContent =
+    today.toLocaleDateString('en-IN', { weekday:'long', month:'long', day:'numeric' });
+
+  document.getElementById('stats-grid').innerHTML = `
+    <div class="stat-card"><div class="stat-num">${done}/${total}</div><div class="stat-lbl">Done today</div></div>
+    <div class="stat-card"><div class="stat-num">${pct}%</div><div class="stat-lbl">Today rate</div></div>
+    <div class="stat-card"><div class="stat-num">${best}</div><div class="stat-lbl">Best streak</div></div>
+    <div class="stat-card"><div class="stat-num">${avg}</div><div class="stat-lbl">7d avg/day</div></div>
+  `;
+
+  const weekRow = document.getElementById('week-row');
+  weekRow.innerHTML = '';
+  for (let i = 6; i >= 0; i--) {
+    const d  = addDays(today, -i);
+    const ds = dateStr(d);
+    const log = await getLog(ds);
+    const hasDone = log.length > 0;
+    const el = document.createElement('div');
+    el.className = 'day-dot';
+    el.innerHTML = `<div class="d-label">${DAYS[d.getDay()]}</div>
+      <div class="d-circle ${i===0?'today':''} ${hasDone?'has-done':''}">${d.getDate()}</div>`;
+    weekRow.appendChild(el);
+  }
+
+  const list = document.getElementById('habits-list');
+  list.querySelectorAll('.habit-card').forEach(e => e.remove());
+  const empty = document.getElementById('empty-msg');
+  if (habits.length === 0) { empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+
+  for (const h of habits) {
+    const checked = todayLog.includes(h.id);
+    const streak  = await getStreak(h.id);
+    const card = document.createElement('div');
+    card.className = 'habit-card' + (checked ? ' done' : '');
+    card.innerHTML = `
+      <button class="check-btn ${checked?'checked':''}" data-id="${h.id}" aria-label="Toggle">
+        <i class="ti ti-check"></i>
+      </button>
+      <div class="habit-info">
+        <div class="habit-name ${checked?'striked':''}">${h.name}</div>
+        <div class="habit-meta">
+          <span class="cat-badge cat-${h.cat}">${h.cat}</span>
+          ${streak>0?`<span class="streak-txt"><i class="ti ti-flame" style="font-size:13px;color:#EF9F27;"></i>${streak}d</span>`:''}
+        </div>
+      </div>
+      <button class="del-btn" data-id="${h.id}" aria-label="Delete"><i class="ti ti-trash" style="font-size:16px;"></i></button>
+    `;
+    card.querySelector('.check-btn').addEventListener('click', () => toggleHabit(h.id));
+    card.querySelector('.del-btn').addEventListener('click', () => deleteHabit(h.id));
+    list.appendChild(card);
+  }
+}
+
+/* ══════════════ ANALYTICS RENDER ══════════════ */
+
+async function renderAnalytics() {
+  const todayLog = await getTodayLog();
+  const done  = habits.filter(h => todayLog.includes(h.id)).length;
+  const total = habits.length;
+  const pct   = total > 0 ? Math.round(done / total * 100) : 0;
+  const best  = await getBestStreak();
+  const avg   = await getWeekAvg();
+
+  document.getElementById('an-stats-grid').innerHTML = `
+    <div class="stat-card"><div class="stat-num">${done}/${total}</div><div class="stat-lbl">Done today</div></div>
+    <div class="stat-card"><div class="stat-num">${pct}%</div><div class="stat-lbl">Today rate</div></div>
+    <div class="stat-card"><div class="stat-num">${best}</div><div class="stat-lbl">Best streak</div></div>
+    <div class="stat-card"><div class="stat-num">${avg}</div><div class="stat-lbl">7d avg/day</div></div>
+  `;
+
+  const remaining = habits.filter(h => !todayLog.includes(h.id));
+  const rc = document.getElementById('remaining-card');
+  if (remaining.length === 0) {
+    rc.innerHTML = '<div class="empty-state"><i class="ti ti-circle-check" style="font-size:24px;display:block;margin-bottom:6px;color:#1D9E75;"></i>All habits done today!</div>';
+  } else {
+    rc.innerHTML = remaining.map(h => `
+      <div class="remaining-item">
+        <span class="cat-dot" style="background:${CAT_COLORS[h.cat]};"></span>
+        <span>${h.name}</span>
+        <span class="cat-badge cat-${h.cat}" style="margin-left:auto;">${h.cat}</span>
+      </div>`).join('');
+  }
+
+  await renderChart();
+}
+
+async function renderChart() {
+  if (mainChart) { mainChart.destroy(); mainChart = null; }
+  const ctx  = document.getElementById('main-chart');
+  const wrap = document.getElementById('chart-wrap');
+  wrap.style.height = '240px';
+
+  if (currentChartTab === 'weekly') {
+    const labels = [], done = [], totals = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = addDays(today, -i);
+      labels.push(DAYS[d.getDay()]);
+      done.push(await getDayDone(dateStr(d)));
+      totals.push(habits.length);
+    }
+    document.getElementById('legend-row').innerHTML = `
+      <span><span class="legend-dot" style="background:#1D9E75;"></span>Done</span>
+      <span><span class="legend-dot" style="background:#D3D1C7;"></span>Total habits</span>`;
+    mainChart = new Chart(ctx, { type:'bar', data:{ labels, datasets:[
+      { label:'Done', data:done, backgroundColor:'#1D9E75', borderRadius:5, borderSkipped:false },
+      { label:'Total', data:totals, backgroundColor:'#D3D1C7', borderRadius:5, borderSkipped:false }
+    ]}, options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ display:false } },
+      scales:{ x:{ ticks:{ autoSkip:false } }, y:{ beginAtZero:true, ticks:{ stepSize:1 } } } } });
+
+  } else if (currentChartTab === 'monthly') {
+    const labels = [], avgs = [];
+    const weeksInMonth = Math.ceil(today.getDate() / 7);
+    for (let w = 0; w < weeksInMonth; w++) {
+      labels.push('Week ' + (w+1));
+      let sum = 0, days = 0;
+      for (let d = 0; d < 7; d++) {
+        const day = w*7+d+1;
+        if (day > today.getDate()) break;
+        sum += await getDayDone(dateStr(new Date(today.getFullYear(), today.getMonth(), day)));
+        days++;
+      }
+      avgs.push(days > 0 ? Math.round(sum/days*10)/10 : 0);
+    }
+    document.getElementById('legend-row').innerHTML = `<span><span class="legend-dot" style="background:#378ADD;"></span>Avg completions per day</span>`;
+    mainChart = new Chart(ctx, { type:'line', data:{ labels, datasets:[
+      { label:'Avg/day', data:avgs, borderColor:'#378ADD', backgroundColor:'rgba(55,138,221,0.1)', fill:true, tension:0.35, pointRadius:5, pointBackgroundColor:'#378ADD' }
+    ]}, options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ display:false } }, scales:{ y:{ beginAtZero:true } } } });
+
+  } else {
+    if (habits.length === 0) { document.getElementById('legend-row').innerHTML=''; return; }
+    const labels = [], pcts = [], colors = [];
+    for (const h of habits) {
+      let cnt = 0;
+      for (let i = 0; i < 7; i++) { const log = await getLog(dateStr(addDays(today,-i))); if (log.includes(h.id)) cnt++; }
+      labels.push(h.name.length > 18 ? h.name.slice(0,17)+'…' : h.name);
+      pcts.push(Math.round(cnt/7*100));
+      colors.push(CAT_COLORS[h.cat]||'#888');
+    }
+    wrap.style.height = Math.max(240, habits.length*46+60)+'px';
+    document.getElementById('legend-row').innerHTML = `<span style="color:var(--text2);">7-day completion % per habit</span>`;
+    mainChart = new Chart(ctx, { type:'bar', data:{ labels, datasets:[
+      { label:'%', data:pcts, backgroundColor:colors, borderRadius:5, borderSkipped:false }
+    ]}, options:{ indexAxis:'y', responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ display:false }, tooltip:{ callbacks:{ label: c => c.parsed.x+'%' } } },
+      scales:{ x:{ beginAtZero:true, max:100, ticks:{ callback: v => v+'%' } }, y:{ ticks:{ autoSkip:false } } } } });
+  }
+}
+
+/* ══════════════ NOTIFICATIONS ══════════════ */
+
+async function enableNotifs() {
+  if (!('Notification' in window)) { showToast('Notifications not supported in this browser.'); return; }
+  const time = document.getElementById('notif-time').value || '20:00';
+  const freq = document.getElementById('notif-freq').value;
+  const perm = await Notification.requestPermission();
+  if (perm === 'granted') {
+    await setDoc(doc(db, 'users', currentUser.uid), { notifTime: time, notifFreq: freq, notifEnabled: true }, { merge: true });
+    scheduleReminder();
+    updateNotifStatus('granted', time, freq);
+    showToast('Reminders enabled!');
+  } else {
+    updateNotifStatus('denied', '', '');
+  }
+}
+
+async function disableNotifs() {
+  await setDoc(doc(db, 'users', currentUser.uid), { notifEnabled: false }, { merge: true });
+  updateNotifStatus('off', '', '');
+  showToast('Reminders disabled.');
+}
+
+function updateNotifStatus(state, time, freq) {
+  const el = document.getElementById('notif-status');
+  if (state === 'granted') {
+    el.innerHTML = `<i class="ti ti-check"></i> Active — ${time} · ${freq}`;
+    el.className = 'notif-status granted';
+  } else if (state === 'denied') {
+    el.innerHTML = `<i class="ti ti-x"></i> Blocked — enable in browser site settings`;
+    el.className = 'notif-status denied';
+  } else {
+    el.innerHTML = `<i class="ti ti-info-circle"></i> Not configured yet`;
+    el.className = 'notif-status';
+  }
+}
+
+async function scheduleReminder() {
+  if (!currentUser) return;
+  const snap = await getDoc(doc(db, 'users', currentUser.uid));
+  if (!snap.exists()) return;
+  const { notifEnabled, notifTime, notifFreq } = snap.data();
+  if (!notifEnabled || Notification.permission !== 'granted') return;
+  const [h, m] = (notifTime || '20:00').split(':').map(Number);
+  const now = new Date();
+  const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0);
+  const diff = target - now;
+  if (diff > 0 && diff < 86400000) {
+    updateNotifStatus('granted', notifTime, notifFreq);
+    setTimeout(async () => {
+      const day = new Date().getDay();
+      if (notifFreq === 'weekdays' && (day===0||day===6)) return;
+      if (notifFreq === 'weekends' && day>=1&&day<=5) return;
+      const log = await getTodayLog();
+      const rem = habits.filter(h => !log.includes(h.id));
+      if (rem.length > 0) {
+        new Notification('HabitFlow reminder', {
+          body: rem.length===1 ? `Still to do: ${rem[0].name}`
+            : `${rem.length} habits left: ${rem.slice(0,2).map(r=>r.name).join(', ')}${rem.length>2?'…':''}`,
+        });
+      }
+    }, diff);
+  }
+}
+
+/* ══════════════ UI HELPERS ══════════════ */
+
+function showPage(id, btn) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
+  document.getElementById('page-' + id).classList.add('active');
+  btn.classList.add('active');
+  if (id === 'analytics') renderAnalytics();
+}
+
+function showAuth(mode) {
+  document.getElementById('app-shell').style.display = 'none';
+  document.getElementById('auth-screen').style.display = 'flex';
+  setAuthMode(mode);
+}
+
+function showApp() {
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('app-shell').style.display = 'block';
+  showPage('tracker', document.querySelector('.nav-tab'));
+}
+
+function setAuthMode(mode) {
+  const isLogin = mode === 'login';
+  document.getElementById('auth-title').textContent = isLogin ? 'Welcome back' : 'Create account';
+  document.getElementById('auth-name-wrap').style.display = isLogin ? 'none' : 'block';
+  document.getElementById('auth-submit').textContent = isLogin ? 'Sign in' : 'Create account';
+  document.getElementById('auth-switch').innerHTML = isLogin
+    ? `No account? <a href="#" onclick="setAuthMode('register')">Sign up</a>`
+    : `Have an account? <a href="#" onclick="setAuthMode('login')">Sign in</a>`;
+  document.getElementById('auth-submit').onclick = isLogin ? loginEmail : registerEmail;
+  clearAuthError();
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+function switchChart(tab, btn) {
+  currentChartTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderChart();
+}
+
+async function exportData() {
+  const out = { user: currentUser.email, habits, logs: logCache };
+  const blob = new Blob([JSON.stringify(out, null, 2)], { type:'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'habitflow-data.json'; a.click();
+}
+
+window.loginGoogle    = loginGoogle;
+window.loginEmail     = loginEmail;
+window.registerEmail  = registerEmail;
+window.logout         = logout;
+window.setAuthMode    = setAuthMode;
+window.showPage       = showPage;
+window.switchChart    = switchChart;
+window.enableNotifs   = enableNotifs;
+window.disableNotifs  = disableNotifs;
+window.saveProfile    = saveProfile;
+window.addHabit       = addHabit;
+window.exportData     = exportData;
+
+document.getElementById('habit-input').addEventListener('keydown', e => { if (e.key==='Enter') addHabit(); });
+</script>
+
+<style>
+  :root {
+    --bg:#f9f9f7; --surface:#ffffff; --surface2:#f2f1ed;
+    --border:rgba(0,0,0,0.1); --border2:rgba(0,0,0,0.18);
+    --text:#1a1a18; --text2:#6b6b67; --text3:#a0a09c;
+    --green:#1D9E75; --green-bg:#EAF3DE; --green-text:#3B6D11;
+    --purple:#7F77DD; --purple-bg:#EEEDFE; --purple-text:#3C3489;
+    --blue:#378ADD; --blue-bg:#E6F1FB; --blue-text:#185FA5;
+    --gray-bg:#F1EFE8; --gray-text:#5F5E5A;
+    --radius:10px; --radius-sm:7px;
+    --font:'Segoe UI',system-ui,-apple-system,sans-serif;
+  }
+  @media(prefers-color-scheme:dark){:root{
+    --bg:#18181a; --surface:#232325; --surface2:#2a2a2d;
+    --border:rgba(255,255,255,0.09); --border2:rgba(255,255,255,0.16);
+    --text:#f0f0ee; --text2:#9a9a96; --text3:#5a5a58;
+    --green-bg:#0a2016; --green-text:#5DCAA5;
+    --purple-bg:#1a1840; --purple-text:#AFA9EC;
+    --blue-bg:#0a1e38; --blue-text:#85B7EB;
+    --gray-bg:#26262a; --gray-text:#B4B2A9;
+  }}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;}
+
+  /* AUTH SCREEN */
+  #auth-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:1rem;}
+  .auth-box{background:var(--surface);border:0.5px solid var(--border);border-radius:var(--radius);padding:2.5rem 2rem;width:100%;max-width:400px;}
+  .auth-logo{font-size:28px;font-weight:700;color:var(--text);margin-bottom:6px;display:flex;align-items:center;gap:8px;}
+  .auth-logo i{color:var(--green);}
+  .auth-sub{font-size:13px;color:var(--text2);margin-bottom:2rem;}
+  .auth-title{font-size:18px;font-weight:600;color:var(--text);margin-bottom:1.25rem;}
+  .field{margin-bottom:12px;}
+  .field label{display:block;font-size:12px;color:var(--text2);margin-bottom:5px;font-weight:500;}
+  .field input{width:100%;padding:10px 12px;border:0.5px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface2);color:var(--text);font-size:14px;font-family:var(--font);outline:none;}
+  .field input:focus{border-color:var(--green);}
+  .btn-primary{width:100%;padding:11px;background:var(--text);color:var(--surface);border:none;border-radius:var(--radius-sm);font-size:14px;font-weight:600;cursor:pointer;margin-top:4px;}
+  .btn-primary:hover{opacity:0.85;}
+  .divider{text-align:center;font-size:12px;color:var(--text3);margin:14px 0;}
+  .btn-google{width:100%;padding:10px;background:var(--surface2);color:var(--text);border:0.5px solid var(--border2);border-radius:var(--radius-sm);font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;font-family:var(--font);}
+  .btn-google:hover{background:var(--border);}
+  .auth-switch{text-align:center;font-size:13px;color:var(--text2);margin-top:16px;}
+  .auth-switch a{color:var(--green);text-decoration:none;font-weight:500;}
+  #auth-error{display:none;background:#FCEBEB;color:#A32D2D;font-size:13px;padding:9px 12px;border-radius:var(--radius-sm);margin-bottom:12px;}
+
+  /* APP SHELL */
+  #app-shell{display:none;}
+  nav{background:var(--surface);border-bottom:0.5px solid var(--border);display:flex;align-items:center;padding:0 1.5rem;height:54px;gap:0;position:sticky;top:0;z-index:100;}
+  .nav-brand{font-size:15px;font-weight:700;color:var(--text);margin-right:1.5rem;display:flex;align-items:center;gap:6px;}
+  .nav-brand i{color:var(--green);font-size:19px;}
+  .nav-tabs{display:flex;gap:2px;flex:1;}
+  .nav-tab{padding:6px 14px;border-radius:var(--radius-sm);border:none;background:transparent;font-size:13px;color:var(--text2);cursor:pointer;display:flex;align-items:center;gap:5px;transition:background 0.15s,color 0.15s;font-family:var(--font);}
+  .nav-tab i{font-size:15px;}
+  .nav-tab:hover{background:var(--surface2);color:var(--text);}
+  .nav-tab.active{background:var(--surface2);color:var(--text);font-weight:500;}
+  .nav-user{display:flex;align-items:center;gap:8px;margin-left:auto;}
+  .nav-avatar{width:28px;height:28px;border-radius:50%;background:var(--purple-bg);color:var(--purple-text);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;}
+  .nav-name{font-size:13px;color:var(--text2);}
+  .btn-sm{padding:6px 12px;background:transparent;border:0.5px solid var(--border2);border-radius:var(--radius-sm);font-size:12px;color:var(--text2);cursor:pointer;font-family:var(--font);}
+  .btn-sm:hover{background:var(--surface2);color:var(--text);}
+
+  /* PAGES */
+  .page{display:none;max-width:680px;margin:0 auto;padding:2rem 1rem 4rem;}
+  .page.active{display:block;}
+  .card{background:var(--surface);border:0.5px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:1.25rem;}
+  .section-label{font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;}
+
+  /* STATS */
+  .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1.25rem;}
+  .stat-card{background:var(--surface2);border-radius:var(--radius-sm);padding:14px;text-align:center;}
+  .stat-num{font-size:22px;font-weight:600;color:var(--text);}
+  .stat-lbl{font-size:11px;color:var(--text2);margin-top:3px;}
+
+  /* ADD ROW */
+  .add-row{display:flex;gap:8px;flex-wrap:wrap;}
+  .add-row input[type=text]{flex:1;min-width:160px;padding:9px 12px;border:0.5px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface2);color:var(--text);font-size:14px;font-family:var(--font);outline:none;}
+  .add-row input[type=text]:focus{border-color:var(--green);}
+  .add-row select{padding:9px 10px;border:0.5px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface2);color:var(--text);font-size:14px;font-family:var(--font);cursor:pointer;outline:none;}
+  .btn-add{padding:9px 18px;background:var(--text);color:var(--surface);border:none;border-radius:var(--radius-sm);font-size:14px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:5px;white-space:nowrap;}
+  .btn-add:hover{opacity:0.85;}
+  .btn-outline{padding:8px 14px;background:transparent;color:var(--text2);border:0.5px solid var(--border2);border-radius:var(--radius-sm);font-size:13px;cursor:pointer;display:flex;align-items:center;gap:5px;font-family:var(--font);}
+  .btn-outline:hover{background:var(--surface2);color:var(--text);}
+
+  /* HABIT CARDS */
+  .habits-list{display:flex;flex-direction:column;gap:8px;}
+  .habit-card{background:var(--surface);border:0.5px solid var(--border);border-radius:var(--radius);padding:13px 16px;display:flex;align-items:center;gap:12px;transition:border-color 0.15s,background 0.15s;}
+  .habit-card.done{border-color:rgba(29,158,117,0.35);background:var(--green-bg);}
+  .check-btn{width:28px;height:28px;border-radius:50%;border:1.5px solid var(--border2);background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.15s;}
+  .check-btn:hover{border-color:var(--green);}
+  .check-btn.checked{background:var(--green);border-color:var(--green);}
+  .check-btn i{font-size:14px;color:white;display:none;}
+  .check-btn.checked i{display:block;}
+  .habit-info{flex:1;}
+  .habit-name{font-size:15px;color:var(--text);}
+  .habit-name.striked{text-decoration:line-through;color:var(--text2);}
+  .habit-meta{display:flex;align-items:center;gap:6px;margin-top:3px;}
+  .cat-badge{font-size:11px;padding:2px 7px;border-radius:20px;font-weight:500;}
+  .cat-health{background:var(--green-bg);color:var(--green-text);}
+  .cat-mind{background:var(--purple-bg);color:var(--purple-text);}
+  .cat-work{background:var(--blue-bg);color:var(--blue-text);}
+  .cat-other{background:var(--gray-bg);color:var(--gray-text);}
+  .streak-txt{font-size:12px;color:var(--text2);display:flex;align-items:center;gap:3px;}
+  .del-btn{background:none;border:none;cursor:pointer;color:var(--text3);padding:4px;border-radius:5px;display:flex;align-items:center;}
+  .del-btn:hover{color:#E24B4A;}
+  .empty-state{text-align:center;padding:2.5rem;color:var(--text3);font-size:14px;}
+
+  /* WEEK ROW */
+  .week-row{display:flex;gap:6px;margin-bottom:1.25rem;}
+  .day-dot{flex:1;text-align:center;}
+  .d-label{font-size:11px;color:var(--text3);margin-bottom:4px;}
+  .d-circle{width:30px;height:30px;border-radius:50%;margin:0 auto;border:0.5px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--text2);}
+  .d-circle.today{border-color:var(--border2);font-weight:600;color:var(--text);}
+  .d-circle.has-done{background:var(--green);border-color:var(--green);color:white;}
+
+  /* ANALYTICS */
+  .tab-row{display:flex;gap:6px;margin-bottom:1.25rem;flex-wrap:wrap;}
+  .tab-btn{padding:7px 16px;border-radius:var(--radius-sm);border:0.5px solid var(--border2);background:transparent;font-size:13px;cursor:pointer;color:var(--text2);font-family:var(--font);transition:all 0.15s;}
+  .tab-btn.active{background:var(--text);color:var(--surface);border-color:var(--text);}
+  .chart-wrap{position:relative;width:100%;height:240px;}
+  .legend-row{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:12px;font-size:12px;color:var(--text2);}
+  .legend-dot{width:10px;height:10px;border-radius:2px;display:inline-block;margin-right:4px;vertical-align:middle;}
+  .remaining-item{display:flex;align-items:center;gap:10px;font-size:14px;padding:9px 12px;border:0.5px solid var(--border);border-radius:var(--radius-sm);margin-bottom:6px;color:var(--text);}
+  .cat-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+
+  /* PROFILE */
+  .profile-avatar{width:64px;height:64px;border-radius:50%;background:var(--purple-bg);color:var(--purple-text);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:600;margin-bottom:12px;}
+  .profile-field{margin-bottom:14px;}
+  .profile-field label{display:block;font-size:12px;color:var(--text2);margin-bottom:5px;font-weight:500;}
+  .profile-field input{width:100%;padding:9px 12px;border:0.5px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface2);color:var(--text);font-size:14px;font-family:var(--font);outline:none;}
+  .profile-field input:focus{border-color:var(--green);}
+  .info-row{display:flex;justify-content:space-between;font-size:13px;padding:8px 0;border-bottom:0.5px solid var(--border);color:var(--text2);}
+  .info-row span:last-child{color:var(--text);font-weight:500;}
+
+  /* NOTIFICATIONS */
+  .notif-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;}
+  .notif-row input[type=time],.notif-row select{padding:8px 10px;border:0.5px solid var(--border2);border-radius:var(--radius-sm);background:var(--surface2);color:var(--text);font-size:14px;font-family:var(--font);outline:none;}
+  .notif-status{font-size:13px;padding:6px 14px;border-radius:var(--radius-sm);background:var(--surface2);color:var(--text2);display:inline-flex;align-items:center;gap:6px;}
+  .notif-status.granted{background:var(--green-bg);color:var(--green-text);}
+  .notif-status.denied{background:#FCEBEB;color:#A32D2D;}
+
+  /* TOAST */
+  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--text);color:var(--surface);padding:10px 20px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;opacity:0;transition:all 0.3s;z-index:9999;white-space:nowrap;}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+
+  @media(max-width:540px){
+    nav{padding:0 1rem;}
+    .nav-name{display:none;}
+    .stats-grid{grid-template-columns:repeat(2,1fr);}
+    .page{padding:1.25rem 0.75rem 3rem;}
+  }
+</style>
+</head>
+<body>
+
+<!-- ══ AUTH SCREEN ══ -->
+<div id="auth-screen">
+  <div class="auth-box">
+    <div class="auth-logo"><i class="ti ti-checkbox"></i> HabitFlow</div>
+    <p class="auth-sub">Your personal habit tracker — syncs across all devices</p>
+    <div id="auth-title" class="auth-title">Welcome back</div>
+    <div id="auth-error"></div>
+    <div id="auth-name-wrap" class="field" style="display:none;">
+      <label>Your name</label>
+      <input type="text" id="auth-name" placeholder="e.g. Arjun Sharma"/>
+    </div>
+    <div class="field">
+      <label>Email address</label>
+      <input type="email" id="auth-email" placeholder="you@email.com"/>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" id="auth-pass" placeholder="••••••••"/>
+    </div>
+    <button class="btn-primary" id="auth-submit" onclick="loginEmail()">Sign in</button>
+    <div class="divider">or</div>
+    <button class="btn-google" onclick="loginGoogle()">
+      <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 01-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 009 18z"/><path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 013.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 000 9c0 1.452.348 2.827.957 4.042l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/></svg>
+      Continue with Google
+    </button>
+    <p class="auth-switch" id="auth-switch">No account? <a href="#" onclick="setAuthMode('register')">Sign up</a></p>
+  </div>
+</div>
+
+<!-- ══ APP SHELL ══ -->
+<div id="app-shell">
+  <nav>
+    <div class="nav-brand"><i class="ti ti-checkbox"></i> HabitFlow</div>
+    <div class="nav-tabs">
+      <button class="nav-tab active" onclick="showPage('tracker',this)"><i class="ti ti-list-check"></i> Tracker</button>
+      <button class="nav-tab" onclick="showPage('analytics',this)"><i class="ti ti-chart-bar"></i> Analytics</button>
+      <button class="nav-tab" onclick="showPage('profile',this)"><i class="ti ti-user"></i> Profile</button>
+    </div>
+    <div class="nav-user">
+      <div class="nav-avatar" id="nav-avatar">?</div>
+      <span class="nav-name" id="nav-name"></span>
+      <button class="btn-sm" onclick="logout()"><i class="ti ti-logout" style="font-size:14px;vertical-align:-2px;"></i> Sign out</button>
+    </div>
+  </nav>
+
+  <!-- TRACKER -->
+  <div class="page active" id="page-tracker">
+    <div style="margin-bottom:1.5rem;">
+      <h1 style="font-size:22px;font-weight:600;"><i class="ti ti-sun" style="font-size:19px;vertical-align:-2px;margin-right:6px;color:var(--green);"></i>Today</h1>
+      <p style="font-size:13px;color:var(--text2);margin-top:3px;" id="date-label"></p>
+    </div>
+    <div class="stats-grid" id="stats-grid"></div>
+    <div class="section-label">This week</div>
+    <div class="week-row" id="week-row"></div>
+    <div class="card">
+      <div class="section-label" style="margin-bottom:12px;">Add a new habit</div>
+      <div class="add-row">
+        <input type="text" id="habit-input" placeholder="e.g. Drink 8 glasses of water" maxlength="50"/>
+        <select id="cat-select">
+          <option value="health">Health</option>
+          <option value="mind">Mind</option>
+          <option value="work">Work</option>
+          <option value="other">Other</option>
+        </select>
+        <button class="btn-add" onclick="addHabit()"><i class="ti ti-plus"></i> Add</button>
+      </div>
+    </div>
+    <div class="section-label">Today's habits</div>
+    <div class="habits-list" id="habits-list">
+      <div class="empty-state" id="empty-msg">
+        <i class="ti ti-plant" style="font-size:28px;display:block;margin-bottom:8px;"></i>
+        No habits yet. Add your first one above!
+      </div>
+    </div>
+  </div>
+
+  <!-- ANALYTICS -->
+  <div class="page" id="page-analytics">
+    <div style="margin-bottom:1.5rem;">
+      <h1 style="font-size:22px;font-weight:600;"><i class="ti ti-chart-bar" style="font-size:19px;vertical-align:-2px;margin-right:6px;color:var(--blue);"></i>Analytics</h1>
+      <p style="font-size:13px;color:var(--text2);margin-top:3px;">Your habit trends</p>
+    </div>
+    <div class="stats-grid" id="an-stats-grid"></div>
+    <div class="section-label">Remaining today</div>
+    <div class="card" id="remaining-card"></div>
+    <div class="section-label" style="margin-top:1.5rem;">Charts</div>
+    <div class="tab-row">
+      <button class="tab-btn active" onclick="switchChart('weekly',this)">Weekly</button>
+      <button class="tab-btn" onclick="switchChart('monthly',this)">Monthly</button>
+      <button class="tab-btn" onclick="switchChart('perhabit',this)">Per habit</button>
+    </div>
+    <div class="card">
+      <div class="legend-row" id="legend-row"></div>
+      <div class="chart-wrap" id="chart-wrap"><canvas id="main-chart" role="img" aria-label="Habit completion chart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- PROFILE -->
+  <div class="page" id="page-profile">
+    <div style="margin-bottom:1.5rem;">
+      <h1 style="font-size:22px;font-weight:600;"><i class="ti ti-user" style="font-size:19px;vertical-align:-2px;margin-right:6px;color:var(--purple);"></i>Profile</h1>
+    </div>
+
+    <div class="card" style="display:flex;flex-direction:column;align-items:center;text-align:center;">
+      <div class="profile-avatar" id="profile-avatar">?</div>
+      <div style="font-size:18px;font-weight:600;" id="profile-name"></div>
+      <div style="font-size:13px;color:var(--text2);margin-top:2px;" id="profile-email"></div>
+    </div>
+
+    <div class="card">
+      <div class="section-label" style="margin-bottom:14px;">Account info</div>
+      <div class="info-row"><span>Member since</span><span id="profile-joined">—</span></div>
+      <div class="info-row" style="border:none;"><span>Habits tracked</span><span id="profile-habit-count">—</span></div>
+    </div>
+
+    <div class="card">
+      <div class="section-label" style="margin-bottom:14px;">Your goal</div>
+      <div class="profile-field">
+        <label>What are you working towards?</label>
+        <input type="text" id="profile-goal" placeholder="e.g. Build a healthier lifestyle" maxlength="80"/>
+      </div>
+      <button class="btn-add" style="width:auto;" onclick="saveProfile()"><i class="ti ti-device-floppy"></i> Save</button>
+    </div>
+
+    <div class="card">
+      <div class="section-label" style="margin-bottom:14px;">Reminders</div>
+      <div class="notif-row">
+        <label style="font-size:14px;color:var(--text2);min-width:70px;">Remind at</label>
+        <input type="time" id="notif-time" value="20:00"/>
+        <select id="notif-freq">
+          <option value="daily">Every day</option>
+          <option value="weekdays">Weekdays only</option>
+          <option value="weekends">Weekends only</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+        <button class="btn-add" style="width:auto;" onclick="enableNotifs()"><i class="ti ti-bell"></i> Enable</button>
+        <button class="btn-outline" onclick="disableNotifs()"><i class="ti ti-bell-off"></i> Disable</button>
+      </div>
+      <div id="notif-status" class="notif-status"><i class="ti ti-info-circle"></i> Not configured yet</div>
+    </div>
+
+    <div class="card">
+      <div class="section-label" style="margin-bottom:12px;">Data</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn-outline" onclick="exportData()"><i class="ti ti-download"></i> Export JSON</button>
+        <button class="btn-outline" onclick="logout()" style="color:#E24B4A;border-color:rgba(226,75,74,0.3);"><i class="ti ti-logout"></i> Sign out</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div id="toast"></div>
+
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const pc = document.getElementById('profile-habit-count');
+    if (pc) {
+      const observer = new MutationObserver(() => {
+        const list = document.getElementById('habits-list');
+        if (list) pc.textContent = list.querySelectorAll('.habit-card').length;
+      });
+      const list = document.getElementById('habits-list');
+      if (list) observer.observe(list, { childList: true });
+    }
+  });
+</script>
+
+</body>
+</html>
